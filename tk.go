@@ -262,29 +262,35 @@ func GetRoomId(token string) (int64, error) {
 /*此功能未验证*/
 func FetchRoomFailData(roomid string, appid string) {
 	go func() {
+		preCnt := -1
+		pageSize := 10
 		for {
 			pagenum := 1
-			payloads, num, err := GetFailData(roomid, appid, "live_gift", pagenum, 10)
+			dataList, cnt, _, err := GetFailData(roomid, appid, "live_gift", pagenum, pageSize)
 			if err != nil {
 				// handle error
 				log.Errorf("Failed to fetch fail data: %v", err)
 			} else {
-				for _, payload := range payloads {
-					log.Error(*payload)
+				for index, data := range dataList {
+					if index >= preCnt {
+						item := data.(map[string]interface{})
+						if item["msg_type"].(string) == "live_gift" {
+							payload := item["payload"].(string)
+							log.Error(payload)
+						}
+					}
 				}
 			}
-			if num != pagenum {
-				if num != 0 {
-					pagenum++
-				}
+			if cnt != pageSize { //未获取全部数据，继续获取该页
+				preCnt = cnt
 				select {
 				case <-stopchans[roomid]:
 					return
-				// Timeout
-				case <-time.After(time.Second): //
-
+				// 1 qps
+				case <-time.After(time.Second):
 				}
 			} else {
+				preCnt = -1
 				pagenum++
 			}
 		}
@@ -292,40 +298,33 @@ func FetchRoomFailData(roomid string, appid string) {
 }
 
 /*此接口未验证*/
-func GetFailData(roomid string, appid string, msg_type string, page_num int, page_size int) ([]*string, int, error) {
+func GetFailData(roomid string, appid string, msg_type string, page_num int, page_size int) ([]interface{}, int, int, error) {
 	url := fmt.Sprintf("https://webcast.bytedance.com/api/live_data/task/fail_data/get?roomid=%s&appid=%s&msg_type=%s&page_num=%d&page_size=%d", roomid, appid, msg_type, page_num, page_size)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	req.Header.Set("access-token", accessToken)
 	req.Header.Set("content-type", "application/json")
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	var result map[string]interface{}
 	err = json.Unmarshal(body, &result)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	if result["err_no"].(float64) != 0 {
-		return nil, 0, fmt.Errorf(result["err_msg"].(string))
+		return nil, 0, 0, fmt.Errorf(result["err_msg"].(string))
 	}
 	dataList := result["data"].(map[string]interface{})["data_list"].([]interface{})
-	var payloads []*string
-	for _, data := range dataList {
-		item := data.(map[string]interface{})
-		if item["msg_type"].(string) == "live_gift" {
-			payload := item["payload"].(string)
-			payloads = append(payloads, &payload)
-		}
-	}
-	return payloads, len(dataList), nil
+	totalCount := int(result["data"].(map[string]interface{})["total_count"].(float64))
+	return dataList, len(dataList), totalCount, nil
 }
