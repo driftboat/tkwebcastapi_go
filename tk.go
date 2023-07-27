@@ -7,14 +7,39 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 )
 
+type DB interface {
+	SetAccessToken(value string) error
+	GetAccessToken() (string, error)
+}
+type RoomManager interface {
+	GetRoomLastActiveTime(roomId string) (time.Time, error)
+}
+
 var accessToken string
 var refreshTokenChan chan string
 var stopchans = make(map[string]chan bool)
+var refreshTokenMutex sync.Mutex
+var database DB
+var roomManager RoomManager
+
+func Init(db DB, roomMgr RoomManager) {
+	database = db
+	roomManager = roomMgr
+}
+
+func NeedRefreshToken(reason string) {
+	refreshTokenMutex.Lock()
+	defer refreshTokenMutex.Unlock()
+	if len(refreshTokenChan) == 0 {
+		refreshTokenChan <- reason
+	}
+}
 
 // 新建一个golang func，参数appid secret grant_type  发送以json格式http请求返回asccess_token
 func GetAccessToken(appid string, secret string, grant_type string) (string, error) {
@@ -45,7 +70,9 @@ func GetAccessToken(appid string, secret string, grant_type string) (string, err
 	if result["err_no"].(float64) != 0 {
 		return "", errors.New(result["err_tips"].(string))
 	}
-	return result["data"].(map[string]interface{})["access_token"].(string), nil
+	accessToken = result["data"].(map[string]interface{})["access_token"].(string)
+	database.SetAccessToken(accessToken)
+	return accessToken, nil
 }
 
 func RefreshAccessToken(appid string, secret string, grant_type string) {
@@ -57,6 +84,8 @@ func RefreshAccessToken(appid string, secret string, grant_type string) {
 			if err != nil {
 				// handle error
 				log.Errorf("Failed to refresh access token: %v", err)
+			} else {
+				database.SetAccessToken(accessToken)
 			}
 			select {
 			case m := <-refreshTokenChan:
@@ -66,6 +95,20 @@ func RefreshAccessToken(appid string, secret string, grant_type string) {
 				log.Info("RefreshToken after a hour")
 			}
 
+		}
+	}()
+}
+
+func FakeRefreshAccessToken(dur time.Duration) {
+	go func() {
+		for {
+			var err error
+			accessToken, err = database.GetAccessToken()
+			if err != nil {
+				// handle error
+				log.Errorf("FakeRefreshAccessToken: %v", err)
+			}
+			time.Sleep(dur)
 		}
 	}()
 }
@@ -104,18 +147,22 @@ func StartTask(roomid string, appid string, msg_type string) (string, error) {
 	}
 	if result["err_no"].(float64) != 0 {
 		if int64(result["err_no"].(float64)) == 40022 {
-			refreshTokenChan <- fmt.Sprintf("RefreshToken:StartTask%f%v", result["err_no"].(float64), result["err_msg"].(string))
+			NeedRefreshToken(fmt.Sprintf("RefreshToken:StartTask%f%v", result["err_no"].(float64), result["err_msg"].(string)))
 		}
 		return "", errors.New(result["err_msg"].(string))
 	}
 	//开启，会定时获取漏传数据
-	//FetchRoomFailData(roomid,appid)
+	//FetchRoomFailData(roomid, appid)
 	return result["data"].(map[string]interface{})["task_id"].(string), nil
 }
 
 func StopTask(roomid string, appid string, msg_type string) (string, error) {
 	//开启，会关闭定时获取漏传数据
-	//stopchans[roomid] <- true
+	//stopchan, ok := stopchans[roomid]
+	//if ok {
+	//	stopchan <- true
+	//}
+
 	url := "https://webcast.bytedance.com/api/live_data/task/stop"
 	data := map[string]string{
 		"roomid":   roomid,
@@ -149,7 +196,7 @@ func StopTask(roomid string, appid string, msg_type string) (string, error) {
 	}
 	if result["err_no"].(float64) != 0 {
 		if int64(result["err_no"].(float64)) == 40022 {
-			refreshTokenChan <- fmt.Sprintf("RefreshToken:StopTask%f%v", result["err_no"].(float64), result["err_msg"].(string))
+			NeedRefreshToken(fmt.Sprintf("RefreshToken:StopTask%f%v", result["err_no"].(float64), result["err_msg"].(string)))
 		}
 		return "", errors.New(result["err_msg"].(string))
 	}
@@ -191,7 +238,7 @@ func SendGiftPostRequest(roomid string, appid string, sec_gift_id_list []string)
 	if errcode, ok := result["errcode"]; ok {
 		if errcode.(float64) != 0 {
 			if int64(errcode.(float64)) == 40022 {
-				refreshTokenChan <- fmt.Sprintf("RefreshToken:SendGiftPostRequest%f%v", result["errcode"].(float64), result["err_msg"].(string))
+				NeedRefreshToken(fmt.Sprintf("RefreshToken:SendGiftPostRequest%f%v", result["errcode"].(float64), result["err_msg"].(string)))
 			}
 			return nil, errors.New(result["errmsg"].(string))
 		}
@@ -208,60 +255,65 @@ func SendGiftPostRequest(roomid string, appid string, sec_gift_id_list []string)
 type RoomInfo struct {
 	Data struct {
 		Info struct {
-			RoomId int64 `json:"room_id"`
+			RoomId   int64  `json:"room_id"`
+			Uid      string `json:"anchor_open_id"`
+			Nickname string `json:"nick_name"`
 		} `json:"info"`
 	} `json:"data"`
 	ErrCode int64  `json:"errcode"`
 	ErrMsg  string `json:"errmsg"`
 }
 
-func GetRoomId(token string) (int64, error) {
+func GetRoomId(token string) (int64, string, string, error) {
 	url := "http://webcast.bytedance.com/api/webcastmate/info"
 	data := map[string]string{
 		"token": token,
 	}
 	jsonData, err := json.Marshal(data)
 	if err != nil {
-		return 0, err
+		return 0, "", "", err
 	}
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return 0, err
+		return 0, "", "", err
 	}
 	req.Header.Set("X-Token", accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, "", "", err
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return 0, err
+		return 0, "", "", err
 	}
 	var result RoomInfo
 	err = json.Unmarshal(body, &result)
 	if err != nil {
-		return 0, err
+		return 0, "", "", err
 	}
 	if result.ErrCode != 0 {
 		if result.ErrCode == 40022 {
-			refreshTokenChan <- fmt.Sprintf("RefreshToken:GetRoomId%d%s", result.ErrCode, result.ErrMsg)
+			NeedRefreshToken(fmt.Sprintf("RefreshToken:GetRoomId%d%s", result.ErrCode, result.ErrMsg))
 		}
-		return 0, errors.New(result.ErrMsg)
+		return 0, "", "", errors.New(result.ErrMsg)
 	}
 	if result.Data.Info.RoomId == 0 {
-		return 0, errors.New("no data in response")
+		return 0, "", "", errors.New("no data in response")
 	}
 
 	roomId := result.Data.Info.RoomId
-	return roomId, nil
+	uid := result.Data.Info.Uid
+	nickname := result.Data.Info.Nickname
+	return roomId, uid, nickname, nil
 }
 
 /*此功能未验证*/
 func FetchRoomFailData(roomid string, appid string) {
 	go func() {
+		stopchans[roomid] = make(chan bool)
 		preCnt := -1
 		pageSize := 10
 		for {
@@ -280,6 +332,13 @@ func FetchRoomFailData(roomid string, appid string) {
 						}
 					}
 				}
+			}
+			lastActiveTime, err := roomManager.GetRoomLastActiveTime(roomid)
+			if err != nil {
+				return
+			}
+			if time.Since(lastActiveTime).Minutes() >= 10 {
+				return
 			}
 			if cnt != pageSize { //未获取全部数据，继续获取该页
 				preCnt = cnt
@@ -322,6 +381,9 @@ func GetFailData(roomid string, appid string, msg_type string, page_num int, pag
 		return nil, 0, 0, err
 	}
 	if result["err_no"].(float64) != 0 {
+		if int64(result["err_no"].(float64)) == 40022 {
+			NeedRefreshToken(fmt.Sprintf("GetFailData%f%v", result["err_no"].(float64), result["err_msg"].(string)))
+		}
 		return nil, 0, 0, fmt.Errorf(result["err_msg"].(string))
 	}
 	dataList := result["data"].(map[string]interface{})["data_list"].([]interface{})
